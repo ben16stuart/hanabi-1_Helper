@@ -1,4 +1,4 @@
-# continuous_optimization.py - Improved version with better error handling
+# continuous_optimization.py - Improved version with local LLM
 # Continuous model training optimization using LLM feedback
 
 import os
@@ -12,13 +12,24 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 import re
 from openai import OpenAI
+import argparse
+from pathlib import Path
+
+# Get the base directory - defaults to ~/Desktop/hanabi or can be set via environment variable
+DEFAULT_BASE = str(Path.home() / "Desktop" / "hanabi")
+BASE_DIR = Path(os.getenv('HANABI_BASE_DIR', DEFAULT_BASE))
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
 
 # === CONFIGURATION ===
 @dataclass
 class ModelParams:
     """Model hyperparameters with validation"""
     WINDOW_SIZE: int = 20
-    HORIZON: int = 2
+    HORIZON: int = 1
     BATCH_SIZE: int = 32
     HIDDEN_DIM: int = 256
     TRANSFORMER_LAYERS: int = 4
@@ -51,7 +62,7 @@ class ModelParams:
             
         # Check memory-intensive combinations
         model_complexity = self.HIDDEN_DIM * self.TRANSFORMER_LAYERS * self.BATCH_SIZE
-        if model_complexity > 500000:  # Arbitrary threshold
+        if model_complexity > 500000:
             issues.append(f"Model too complex (complexity: {model_complexity}), reduce HIDDEN_DIM, LAYERS, or BATCH_SIZE")
         
         if issues:
@@ -68,7 +79,6 @@ class ModelParams:
         
         # Fix NUM_HEADS divisibility
         if fixed.HIDDEN_DIM % fixed.NUM_HEADS != 0:
-            # Find the largest valid NUM_HEADS
             for heads in [8, 4, 2, 1]:
                 if fixed.HIDDEN_DIM % heads == 0:
                     fixed.NUM_HEADS = heads
@@ -85,12 +95,10 @@ class ModelParams:
         # Reduce complexity if too high
         model_complexity = fixed.HIDDEN_DIM * fixed.TRANSFORMER_LAYERS * fixed.BATCH_SIZE
         if model_complexity > 500000:
-            # Scale down proportionally
             scale_factor = (500000 / model_complexity) ** 0.5
             fixed.HIDDEN_DIM = int(fixed.HIDDEN_DIM * scale_factor)
             fixed.BATCH_SIZE = max(8, int(fixed.BATCH_SIZE * scale_factor))
             
-            # Ensure NUM_HEADS still divides HIDDEN_DIM
             for heads in [8, 4, 2, 1]:
                 if fixed.HIDDEN_DIM % heads == 0:
                     fixed.NUM_HEADS = heads
@@ -121,28 +129,64 @@ class TrainingResult:
     success: bool = False
 
 class ContinuousOptimizer:
-    def __init__(self, 
-                 rolling_retrain_script: str = "rolling_retrain.py",
+    def __init__(self,
+                 rolling_retrain_script: str = None,
                  max_iterations: int = 50,
-                 log_file: str = "optimization_log.csv",
-                 results_file: str = "optimization_results.json",
-                 openai_client: OpenAI = None,
-                 claude_api_key: str = None):
+                 log_file: str = None,
+                 results_file: str = None,
+                 local_model: str = "qwen2.5-coder:14b",
+                 TICKER: str = None,
+                 resume: bool = True,
+                 base_dir: Path = None):
+
+        # Store TICKER first
+        if TICKER is None:
+            raise ValueError("TICKER must be provided")
+        self.TICKER = TICKER
         
-        self.rolling_retrain_script = rolling_retrain_script
+        # Set base directory (can be overridden, otherwise uses BASE_DIR constant)
+        self.base_dir = Path(base_dir) if base_dir else BASE_DIR
+        
+        # Create ticker-specific directory
+        self.ticker_dir = self.base_dir / self.TICKER / "trained_models"
+        
+        # Now construct the paths using TICKER
+        if log_file is None:
+            self.log_file = str(self.ticker_dir / "optimization_log.csv")
+        else:
+            self.log_file = log_file
+            
+        if results_file is None:
+            self.results_file = str(self.ticker_dir / "optimization_results.json")
+        else:
+            self.results_file = results_file
+
+        # ✅ Resolve the absolute path to rolling_retrain.py
+        if rolling_retrain_script is None:
+            # Look for rolling_retrain.py in the same directory as this script
+            script_dir = Path(__file__).parent
+            self.rolling_retrain_script = str(script_dir / "rolling_retrain.py")
+        else:
+            self.rolling_retrain_script = str(Path(rolling_retrain_script).resolve())
+        
         self.max_iterations = max_iterations
-        self.log_file = log_file
-        self.results_file = results_file
-        self.openai_client = openai_client
-        self.claude_api_key = claude_api_key
+        self.local_model = local_model
+        self.resume = resume
         
         self.iteration = 0
         self.results_history: List[TrainingResult] = []
         self.best_result: Optional[TrainingResult] = None
-        self.failed_params: List[ModelParams] = []  # Track failed parameter sets
+        self.failed_params: List[ModelParams] = []
+        
+        # Ensure the directory exists
+        self.ticker_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize logging
         self.setup_logging()
+        
+        # Load previous results if resuming
+        if self.resume:
+            self.load_previous_results()
         
     def setup_logging(self):
         """Setup CSV logging for results"""
@@ -156,6 +200,67 @@ class ContinuousOptimizer:
                     'num_heads', 'dropout', 'learning_rate', 'weight_decay', 'direction_weight',
                     'focal_gamma', 'epochs', 'patience', 'min_price_change', 'direction_threshold', 'seed'
                 ])
+    
+    def load_previous_results(self):
+        """Load previous optimization results to resume from best configuration"""
+        if os.path.exists(self.results_file):
+            try:
+                with open(self.results_file, 'r') as f:
+                    previous_results = json.load(f)
+                
+                if previous_results:
+                    print(f"\n📂 Loading previous results from {self.results_file}")
+                    
+                    for result_dict in previous_results:
+                        params_dict = result_dict['params']
+                        params = ModelParams(**params_dict)
+                        
+                        result = TrainingResult(
+                            iteration=result_dict['iteration'],
+                            timestamp=result_dict['timestamp'],
+                            params=params,
+                            accuracy=result_dict.get('accuracy'),
+                            f1_score=result_dict.get('f1_score'),
+                            precision=result_dict.get('precision'),
+                            recall=result_dict.get('recall'),
+                            training_time=result_dict.get('training_time'),
+                            error=result_dict.get('error'),
+                            success=result_dict.get('success', False)
+                        )
+                        
+                        self.results_history.append(result)
+                        
+                        if result.success:
+                            self.update_best_result(result)
+                    
+                    if self.results_history:
+                        self.iteration = max(r.iteration for r in self.results_history)
+                    
+                    print(f"✅ Loaded {len(self.results_history)} previous results")
+                    print(f"📊 Starting from iteration {self.iteration + 1}")
+                    
+                    if self.best_result:
+                        print(f"🏆 Best previous result:")
+                        print(f"   Iteration: {self.best_result.iteration}")
+                        print(f"   Accuracy: {self.best_result.accuracy:.4f}")
+                        print(f"   F1 Score: {self.best_result.f1_score:.4f}")
+                    
+            except Exception as e:
+                print(f"⚠️ Could not load previous results: {e}")
+                print("   Starting fresh...")
+        else:
+            print(f"🔍 No previous results found at {self.results_file}")
+            print("   Starting fresh optimization...")
+    
+    def get_initial_params(self) -> ModelParams:
+        """Get initial parameters - either from best result or defaults"""
+        if self.best_result is not None:
+            print(f"\n🎯 Starting with best previous configuration")
+            print(f"   (Iteration {self.best_result.iteration}: {self.best_result.accuracy:.4f} accuracy)")
+            return ModelParams(**asdict(self.best_result.params))
+        else:
+            print(f"\n🎯 Starting with default configuration")
+            return ModelParams()
     
     def log_result(self, result: TrainingResult):
         """Log result to CSV file"""
@@ -179,11 +284,9 @@ class ContinuousOptimizer:
     
     def modify_rolling_retrain_params(self, params: ModelParams) -> str:
         """Create a modified version of rolling_retrain.py with new parameters"""
-        # Read the original script
         with open(self.rolling_retrain_script, 'r') as f:
             script_content = f.read()
         
-        # Update parameters in the script content
         param_updates = {
             'WINDOW_SIZE': params.WINDOW_SIZE,
             'HORIZON': params.HORIZON,
@@ -203,14 +306,13 @@ class ContinuousOptimizer:
             'SEED': params.SEED
         }
         
-        # Replace parameter values in the script
         for param_name, param_value in param_updates.items():
             pattern = f'^{param_name} = .*$'
             replacement = f'{param_name} = {param_value}'
             script_content = re.sub(pattern, replacement, script_content, flags=re.MULTILINE)
         
-        # Write modified script
-        modified_script = f"rolling_retrain_modified_{self.iteration}.py"
+        # Write modified script to ticker directory
+        modified_script = str(self.ticker_dir / f"rolling_retrain_modified_{self.iteration}.py")
         with open(modified_script, 'w') as f:
             f.write(script_content)
         
@@ -220,6 +322,13 @@ class ContinuousOptimizer:
         """Run training with given parameters and capture results"""
         start_time = time.time()
         timestamp = datetime.now().isoformat()
+        
+        # Check current best model timestamp BEFORE training
+        model_path = self.ticker_dir / "best_financial_model.pt"
+        old_mtime = None
+        if model_path.exists():
+            old_mtime = model_path.stat().st_mtime
+            print(f"📦 Current model timestamp: {datetime.fromtimestamp(old_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
         
         result = TrainingResult(
             iteration=self.iteration,
@@ -235,10 +344,9 @@ class ContinuousOptimizer:
                 result.error = "Parameter validation failed even after auto-fix"
                 result.success = False
                 return result
-            result.params = params  # Update with fixed params
+            result.params = params
         
         try:
-            # Create modified script with new parameters
             modified_script = self.modify_rolling_retrain_params(params)
             
             print(f"\n{'='*60}")
@@ -250,9 +358,8 @@ class ContinuousOptimizer:
                 print(f"  {key}: {value}")
             print(f"{'='*60}")
             
-            # Run the modified script
-            cmd = ["python", modified_script]
-            process_result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)  # 1 hour timeout
+            cmd = ["python", modified_script, "--TICKER", self.TICKER]
+            process_result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
             
             # Clean up modified script
             if os.path.exists(modified_script):
@@ -261,11 +368,18 @@ class ContinuousOptimizer:
             training_time = time.time() - start_time
             result.training_time = training_time
             
-            # Save full output for debugging
             full_output = process_result.stdout + "\n" + process_result.stderr
             
+            # Check if model file was updated
+            if model_path.exists():
+                new_mtime = model_path.stat().st_mtime
+                if old_mtime and new_mtime > old_mtime:
+                    print(f"✅ Model file was updated!")
+                    print(f"   New timestamp: {datetime.fromtimestamp(new_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+                elif old_mtime:
+                    print(f"⚠️  Model file was NOT updated (same timestamp)")
+            
             if process_result.returncode == 0:
-                # Parse results from output
                 metrics = self.parse_training_output(full_output)
                 
                 if metrics:
@@ -277,27 +391,21 @@ class ContinuousOptimizer:
                     
                     print(f"✅ Training completed successfully!")
                     print(f"📊 Results: Accuracy={result.accuracy:.4f}, F1={result.f1_score:.4f}")
-                    print(f"⏱️  Training time: {training_time:.1f} seconds")
+                    print(f"⏱️ Training time: {training_time:.1f} seconds")
                 else:
-                    # Save output to file for debugging
-                    debug_file = f"debug_output_iter_{self.iteration}.txt"
+                    debug_file = self.ticker_dir / f"debug_output_iter_{self.iteration}.txt"
                     with open(debug_file, 'w') as f:
                         f.write(full_output)
                     
-                    result.error = f"Could not parse training metrics from output. Debug saved to {debug_file}"
+                    result.error = f"Could not parse training metrics. Debug saved to {debug_file}"
                     result.success = False
-                    print(f"❌ Could not parse training results - check {debug_file}")
             else:
-                # Training script failed
                 self.failed_params.append(params)
-                
-                # Extract key error information
                 error_summary = self.extract_error_summary(full_output)
                 result.error = f"Training failed: {error_summary}"
                 result.success = False
                 
-                # Save detailed error output
-                error_file = f"error_output_iter_{self.iteration}.txt"
+                error_file = self.ticker_dir / f"error_output_iter_{self.iteration}.txt"
                 with open(error_file, 'w') as f:
                     f.write(full_output)
                 
@@ -307,11 +415,9 @@ class ContinuousOptimizer:
         except subprocess.TimeoutExpired:
             result.error = "Training timed out after 1 hour"
             result.success = False
-            print(f"❌ Training timed out")
         except Exception as e:
             result.error = f"Unexpected error: {str(e)}"
             result.success = False
-            print(f"❌ Unexpected error: {e}")
         
         return result
     
@@ -319,7 +425,6 @@ class ContinuousOptimizer:
         """Extract a concise error summary from training output"""
         lines = output.split('\n')
         
-        # Look for common error patterns
         error_patterns = [
             r'ValueError: (.+)',
             r'RuntimeError: (.+)',
@@ -334,234 +439,201 @@ class ContinuousOptimizer:
                 if match:
                     return match.group(1) if match.groups() else match.group(0)
         
-        # Fallback: return last non-empty line
         for line in reversed(lines):
             if line.strip():
-                return line.strip()[:200]  # Limit length
+                return line.strip()[:200]
         
         return "Unknown error"
     
     def parse_training_output(self, output: str) -> Optional[Dict[str, float]]:
-        """Parse training metrics from script output - improved version"""
+        """Parse training metrics from script output"""
         metrics = {}
         
-        # Look for metrics in the output - Updated patterns
         patterns = {
-            # Match: "🎯 Active model performance: 0.5668 accuracy, 0.4521 F1"
             'accuracy': r'Active model performance:\s*([0-9]*\.?[0-9]+)\s*accuracy',
             'f1': r'accuracy,\s*([0-9]*\.?[0-9]+)\s*F1',
-            
-            # Alternative patterns for individual metric lines:
             'accuracy_alt': r'-\s*Accuracy:\s*([0-9]*\.?[0-9]+)',
             'f1_alt': r'-\s*F1 Score:\s*([0-9]*\.?[0-9]+)',
             'precision': r'Direction Precision:\s*([0-9]*\.?[0-9]+)',
             'recall': r'Direction Recall:\s*([0-9]*\.?[0-9]+)',
-            
-            # Additional patterns for evaluation output:
-            'accuracy_eval': r'Direction Accuracy:\s*([0-9]*\.?[0-9]+)',
-            'f1_eval': r'Direction F1 Score:\s*([0-9]*\.?[0-9]+)',
         }
         
-        # Try to extract metrics using all patterns
         for line in output.split('\n'):
-            # Try accuracy patterns
             if 'accuracy' not in metrics:
-                for pattern_name in ['accuracy', 'accuracy_alt', 'accuracy_eval']:
+                for pattern_name in ['accuracy', 'accuracy_alt']:
                     match = re.search(patterns[pattern_name], line, re.IGNORECASE)
                     if match:
                         metrics['accuracy'] = float(match.group(1))
                         break
             
-            # Try F1 patterns
             if 'f1' not in metrics:
-                for pattern_name in ['f1', 'f1_alt', 'f1_eval']:
+                for pattern_name in ['f1', 'f1_alt']:
                     match = re.search(patterns[pattern_name], line, re.IGNORECASE)
                     if match:
                         metrics['f1'] = float(match.group(1))
                         break
             
-            # Try precision pattern
             if 'precision' not in metrics:
                 match = re.search(patterns['precision'], line, re.IGNORECASE)
                 if match:
                     metrics['precision'] = float(match.group(1))
             
-            # Try recall pattern
             if 'recall' not in metrics:
                 match = re.search(patterns['recall'], line, re.IGNORECASE)
                 if match:
                     metrics['recall'] = float(match.group(1))
         
-        # Debug output to help troubleshoot
-        if len(metrics) < 2:
-            print(f"🔍 DEBUG: Only found {len(metrics)} metrics: {metrics}")
-            print("🔍 DEBUG: Sample output lines:")
-            lines = output.split('\n')
-            for i, line in enumerate(lines):
-                if any(keyword in line.lower() for keyword in ['accuracy', 'f1', 'precision', 'recall', 'performance']):
-                    print(f"   Line {i}: {line}")
-        
         return metrics if len(metrics) >= 2 else None
     
     def create_llm_prompt(self, recent_results: List[TrainingResult]) -> str:
         """Create prompt for LLM analysis with failure information"""
-        prompt = """You are an expert in deep learning and financial time series forecasting. I'm training transformer-based models for stock price direction prediction and need your help optimizing hyperparameters.
+        prompt = """You are an expert in deep learning and financial time series forecasting. 
+        I am training transformer-based models for stock price direction prediction. 
+        You will analyze recent training outcomes and recommend the next parameter set to test. 
+        Base your reasoning on *exploration vs exploitation balance*, validation consistency, and potential overfitting or underfitting patterns.
 
-RECENT RESULTS:
-"""
-        
-        for result in recent_results[-5:]:  # Last 5 results
+        RECENT RESULTS:
+        """
+        for result in recent_results[-5:]:
             if result.success:
                 prompt += f"""
-Iteration {result.iteration}: ✅ SUCCESS
-- Accuracy: {result.accuracy:.4f}
-- F1 Score: {result.f1_score:.4f}  
-- Time: {result.training_time:.1f}s
-- Parameters: Window={result.params.WINDOW_SIZE}, Batch={result.params.BATCH_SIZE}, Hidden={result.params.HIDDEN_DIM}, Layers={result.params.TRANSFORMER_LAYERS}, Heads={result.params.NUM_HEADS}, LR={result.params.LEARNING_RATE}, Dropout={result.params.DROPOUT}
-"""
+        Iteration {result.iteration}: ✅ SUCCESS
+        - Accuracy: {result.accuracy:.4f}
+        - F1 Score: {result.f1_score:.4f}  
+        - Time: {result.training_time:.1f}s
+        - Parameters: Window={result.params.WINDOW_SIZE}, Batch={result.params.BATCH_SIZE}, Hidden={result.params.HIDDEN_DIM}, Layers={result.params.TRANSFORMER_LAYERS}, Heads={result.params.NUM_HEADS}, LR={result.params.LEARNING_RATE}, Dropout={result.params.DROPOUT}
+        """
             else:
                 prompt += f"""
-Iteration {result.iteration}: ❌ FAILED - {result.error[:100]}
-- Parameters: Window={result.params.WINDOW_SIZE}, Batch={result.params.BATCH_SIZE}, Hidden={result.params.HIDDEN_DIM}, Layers={result.params.TRANSFORMER_LAYERS}, Heads={result.params.NUM_HEADS}
-"""
-        
+        Iteration {result.iteration}: ❌ FAILED - {result.error[:100]}
+        - Parameters: Window={result.params.WINDOW_SIZE}, Batch={result.params.BATCH_SIZE}, Hidden={result.params.HIDDEN_DIM}, Layers={result.params.TRANSFORMER_LAYERS}, Heads={result.params.NUM_HEADS}
+        """
+
         if self.best_result:
             prompt += f"""
-BEST RESULT SO FAR:
-- Accuracy: {self.best_result.accuracy:.4f}, F1: {self.best_result.f1_score:.4f}
-- Best Parameters: {asdict(self.best_result.params)}
-"""
-        
-        # Add information about failed parameter combinations
+        BEST RESULT SO FAR:
+        - Accuracy: {self.best_result.accuracy:.4f}, F1: {self.best_result.f1_score:.4f}
+        - Best Parameters: {asdict(self.best_result.params)}
+        """
+
         if self.failed_params:
-            prompt += f"""
-FAILED PARAMETER COMBINATIONS TO AVOID:
-"""
-            for params in self.failed_params[-3:]:  # Last 3 failed attempts
+            prompt += """
+        FAILED PARAMETER COMBINATIONS TO AVOID:
+        """
+            for params in self.failed_params[-3:]:
                 prompt += f"- Hidden={params.HIDDEN_DIM}, Layers={params.TRANSFORMER_LAYERS}, Batch={params.BATCH_SIZE}, Window={params.WINDOW_SIZE}\n"
-        
+
         prompt += """
-PARAMETER CONSTRAINTS (IMPORTANT):
-- HIDDEN_DIM must be divisible by NUM_HEADS evenly
-- Avoid very large models (Hidden*Layers*Batch < 500,000 complexity)
-- BATCH_SIZE should be >= 8 to avoid batch normalization issues
-- WINDOW_SIZE should be <= 50 for memory efficiency
-- Conservative changes work better than dramatic ones
+        PARAMETER CONSTRAINTS (IMPORTANT):
+        - HIDDEN_DIM must be divisible by NUM_HEADS evenly.
+        - Avoid very large models (Hidden*Layers*Batch < 500,000 complexity).
+        - BATCH_SIZE should be >= 8 to avoid normalization issues.
+        - WINDOW_SIZE should be <= 50 for memory efficiency.
 
-SAFE PARAMETER RANGES:
-- WINDOW_SIZE: 15-40 (sequence length)
-- HORIZON: 1-3 (prediction horizon)  
-- BATCH_SIZE: 16-64 (avoid too large)
-- HIDDEN_DIM: 128-512 (must divide evenly by NUM_HEADS)
-- TRANSFORMER_LAYERS: 2-6 (avoid too deep)
-- NUM_HEADS: 2, 4, 8, 16 (must divide HIDDEN_DIM)
-- DROPOUT: 0.1-0.25
-- LEARNING_RATE: 0.0001-0.002
-- EPOCHS: 100-250
+        SAFE PARAMETER RANGES:
+        - WINDOW_SIZE: 15-40 (sequence length)
+        - HORIZON: 1 (keep prediction horizon at 1)
+        - BATCH_SIZE: 16-64
+        - HIDDEN_DIM: 128-512 (must divide evenly by NUM_HEADS)
+        - TRANSFORMER_LAYERS: 2-6
+        - NUM_HEADS: 2, 4, 8, 16
+        - DROPOUT: 0.1-0.25
+        - LEARNING_RATE: 0.0001-0.002
+        - WEIGHT_DECAY: 0.0001-0.01
+        - FOCAL_GAMMA: 0.5-2.0
+        - DIRECTION_WEIGHT: 0.5-1.0
+        - EPOCHS: 100-250
 
-Based on the results, suggest parameters that:
-1. Avoid the failed combinations above
-2. Make incremental improvements from successful runs
-3. Stay within safe complexity limits
-4. Ensure NUM_HEADS divides HIDDEN_DIM evenly
+        STRATEGIC ADJUSTMENT RULES:
+        - If the last 5 successful runs show **less than 0.2% improvement**, increase search diversity by changing 2-3 parameters more significantly (20-50% from last best).
+        - If accuracy is volatile or unstable, prioritize **stabilization**: smaller learning rate changes (x0.5-x1.2), higher dropout, or slightly larger batch.
+        - If all recent models underfit, increase model capacity (Hidden_DIM or Layers).
+        - If all overfit, lower model capacity or raise dropout.
+        - If plateaued for >50 iterations, propose **a broader search range** (e.g., test new Window sizes or alternate Head counts).
+        - Always maintain NUM_HEADS dividing HIDDEN_DIM evenly.
 
-Respond with ONLY a JSON object:
-{
-    "WINDOW_SIZE": 25,
-    "HORIZON": 2,
-    "BATCH_SIZE": 32,
-    "HIDDEN_DIM": 256,
-    "TRANSFORMER_LAYERS": 4,
-    "NUM_HEADS": 8,
-    "DROPOUT": 0.15,
-    "LEARNING_RATE": 0.0008,
-    "WEIGHT_DECAY": 0.001,
-    "DIRECTION_WEIGHT": 0.7,
-    "FOCAL_GAMMA": 0.6,
-    "EPOCHS": 150,
-    "PATIENCE": 15,
-    "MIN_PRICE_CHANGE": 0.001,
-    "DIRECTION_THRESHOLD": 0.55,
-    "SEED": 7890
-}
-"""
+        REPORTING REQUIREMENTS:
+        1. Briefly classify the recent performance trend as one of: ["improving", "plateaued", "overfitting", "unstable"].
+        2. State whether to make **small incremental changes** or **larger exploratory jumps** next.
+        3. Suggest exactly ONE new parameter configuration as JSON.
+        4. Include small justification (<40 words) in a "reason" field explaining your rationale.
+
+        Respond ONLY with a JSON object in this format:
+        {
+            "trend": "plateaued",
+            "strategy": "explore_larger_changes",
+            "reason": "Recent runs show diminishing improvement; increasing window and hidden dim may capture longer context.",
+            "WINDOW_SIZE": 30,
+            "HORIZON": 1,
+            "BATCH_SIZE": 32,
+            "HIDDEN_DIM": 384,
+            "TRANSFORMER_LAYERS": 4,
+            "NUM_HEADS": 8,
+            "DROPOUT": 0.18,
+            "LEARNING_RATE": 0.0006,
+            "WEIGHT_DECAY": 0.001,
+            "DIRECTION_WEIGHT": 0.7,
+            "FOCAL_GAMMA": 0.8,
+            "EPOCHS": 150,
+            "PATIENCE": 15,
+            "MIN_PRICE_CHANGE": 0.001,
+            "DIRECTION_THRESHOLD": 0.55,
+            "SEED": 7890
+        }
+        """
         return prompt
     
-    def query_openai(self, prompt: str) -> Optional[str]:
-        """Query OpenAI GPT for parameter suggestions"""
-        if not self.openai_client:
-            return None
-            
+    def query_ollama(self, prompt: str, model: str = "qwen2.5-coder:32b") -> Optional[str]:
+        """Query local Ollama instance"""
         try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.3
+            import requests
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.3}},
+                timeout=60
             )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"❌ OpenAI API error: {e}")
-            return None
-    
-    def query_claude(self, prompt: str) -> Optional[str]:
-        """Query Claude for parameter suggestions"""
-        if not self.claude_api_key:
-            return None
-        
-        import requests
-            
-        headers = {
-            "x-api-key": self.claude_api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01"
-        }
-        
-        data = {
-            "model": "claude-3-sonnet-20240229",
-            "max_tokens": 500,
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        
-        try:
-            response = requests.post("https://api.anthropic.com/v1/messages", 
-                                   headers=headers, json=data, timeout=30)
             response.raise_for_status()
-            return response.json()["content"][0]["text"].strip()
+            return response.json()["response"]
         except Exception as e:
-            print(f"❌ Claude API error: {e}")
+            print(f"Ollama API error: {e}")
             return None
     
     def get_llm_suggestions(self, recent_results: List[TrainingResult]) -> Optional[ModelParams]:
         """Get parameter suggestions from LLM"""
         prompt = self.create_llm_prompt(recent_results)
         
-        print(f"\n🤖 Querying LLM for parameter suggestions...")
+        print(f"\n🤖 Querying local LLM ({self.local_model}) for parameter suggestions...")
         
-        # Try OpenAI first, then Claude
-        response = None
-        if self.openai_client:
-            response = self.query_openai(prompt)
-        
-        if not response and self.claude_api_key:
-            response = self.query_claude(prompt)
+        response = self.query_ollama(prompt, self.local_model)
         
         if not response:
             print(f"❌ No LLM response available")
             return self.get_fallback_params()
         
         try:
-            # Extract JSON from response
             json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
-                params_dict = json.loads(json_str)
+                full_response = json.loads(json_str)
+                
+                # ✅ Extract and display analysis fields (trend, strategy, reason)
+                trend = full_response.get('trend', 'unknown')
+                strategy = full_response.get('strategy', 'unknown')
+                reason = full_response.get('reason', 'No reason provided')
+                
+                print(f"\n📊 LLM Analysis:")
+                print(f"   📈 Trend: {trend}")
+                print(f"   🎯 Strategy: {strategy}")
+                print(f"   💡 Reason: {reason}")
+                
+                # ✅ Filter to only ModelParams fields
+                valid_param_keys = set(ModelParams.__dataclass_fields__.keys())
+                params_dict = {k: v for k, v in full_response.items() if k in valid_param_keys}
                 
                 new_params = ModelParams(**params_dict)
                 
-                # Validate the suggested parameters
                 if not new_params.validate():
-                    print(f"⚠️  LLM suggested invalid parameters, auto-fixing...")
+                    print(f"⚠️ LLM suggested invalid parameters, auto-fixing...")
                     new_params = new_params.fix_validation_issues()
                 
                 print(f"✅ LLM suggested new parameters")
@@ -575,28 +647,19 @@ Respond with ONLY a JSON object:
             return self.get_fallback_params()
     
     def get_fallback_params(self) -> ModelParams:
-        """Get conservative fallback parameters when LLM fails"""
+        """Get conservative fallback parameters"""
         if self.best_result:
-            # Make small modifications to best known parameters
-            best_params = self.best_result.params
-            fallback = ModelParams(**asdict(best_params))
-            
-            # Make small conservative changes
-            fallback.LEARNING_RATE *= 0.9  # Slightly lower learning rate
-            fallback.DROPOUT = min(0.3, fallback.DROPOUT + 0.02)  # Slightly more dropout
-            
-            print("🔄 Using conservative fallback based on best result")
+            fallback = ModelParams(**asdict(self.best_result.params))
+            fallback.LEARNING_RATE *= 0.9
+            fallback.DROPOUT = min(0.3, fallback.DROPOUT + 0.02)
             return fallback
-        else:
-            # Use default conservative parameters
-            print("🔄 Using default conservative parameters")
-            return ModelParams()
+        return ModelParams()
     
     def update_best_result(self, result: TrainingResult):
         """Update best result if current is better"""
         if not result.success:
             return
-            
+        
         if (self.best_result is None or 
             result.accuracy > self.best_result.accuracy or 
             (result.accuracy == self.best_result.accuracy and result.f1_score > self.best_result.f1_score)):
@@ -604,102 +667,81 @@ Respond with ONLY a JSON object:
             print(f"🏆 NEW BEST RESULT! Accuracy: {result.accuracy:.4f}, F1: {result.f1_score:.4f}")
     
     def run_optimization_loop(self):
-        """Main optimization loop with better error handling"""
+        """Main optimization loop"""
         print(f"""
-🎯 CONTINUOUS MODEL OPTIMIZATION STARTED
+🎯 CONTINUOUS MODEL OPTIMIZATION {'(RESUMING)' if self.resume and self.results_history else '(STARTING FRESH)'}
 📊 Max iterations: {self.max_iterations}
+📁 Base directory: {self.base_dir}
 📝 Logging to: {self.log_file}
 💾 Results saved to: {self.results_file}
-🤖 LLM APIs: {'OpenAI' if self.openai_client else ''} {'Claude' if self.claude_api_key else ''}
+🤖 LLM: {self.local_model}
+📊 Ticker: {self.TICKER}
 """)
         
-        # Start with default parameters
-        current_params = ModelParams()
+        current_params = self.get_initial_params()
         consecutive_failures = 0
         
         while self.iteration < self.max_iterations:
             self.iteration += 1
             
-            # Run training
             result = self.run_training(current_params)
-            
-            # Log and save results
             self.results_history.append(result)
             self.log_result(result)
             self.save_results()
             self.update_best_result(result)
             
-            print(f"\n📈 ITERATION {self.iteration} SUMMARY:")
-            print(f"   Success: {result.success}")
             if result.success:
-                print(f"   Accuracy: {result.accuracy:.4f}")
-                print(f"   F1 Score: {result.f1_score:.4f}")
-                consecutive_failures = 0  # Reset failure count
+                consecutive_failures = 0
             else:
-                print(f"   Error: {result.error}")
                 consecutive_failures += 1
             
-            if self.best_result:
-                print(f"   Best so far: {self.best_result.accuracy:.4f} accuracy (iteration {self.best_result.iteration})")
-            
-            # Check for too many consecutive failures
             if consecutive_failures >= 3:
-                print("⚠️  Too many consecutive failures. Reverting to best known parameters...")
-                if self.best_result:
-                    current_params = ModelParams(**asdict(self.best_result.params))
-                else:
-                    current_params = ModelParams()  # Reset to defaults
+                print("⚠️ Too many failures. Reverting to best parameters...")
+                current_params = self.get_fallback_params()
                 consecutive_failures = 0
             
-            # Get LLM suggestions for next iteration
             if self.iteration < self.max_iterations:
                 new_params = self.get_llm_suggestions(self.results_history)
                 if new_params:
                     current_params = new_params
-                else:
-                    print("⚠️  Using fallback parameters")
-                
-                # Wait a bit between iterations
-                print(f"\n⏸️  Waiting 30 seconds before next iteration...")
-                time.sleep(30)
+                time.sleep(3)
         
-        # Final summary
         print(f"\n🎉 OPTIMIZATION COMPLETE!")
-        print(f"Total iterations: {self.max_iterations}")
-        successful_runs = len([r for r in self.results_history if r.success])
-        print(f"Successful runs: {successful_runs}/{self.max_iterations}")
-        
         if self.best_result:
-            print(f"\n🏆 BEST RESULT:")
-            print(f"   Iteration: {self.best_result.iteration}")
-            print(f"   Accuracy: {self.best_result.accuracy:.4f}")
-            print(f"   F1 Score: {self.best_result.f1_score:.4f}")
-            print(f"   Parameters: {asdict(self.best_result.params)}")
+            best_params_file = self.ticker_dir / f"best_params_{self.TICKER}.json"
+            with open(best_params_file, 'w') as f:
+                json.dump({
+                    'iteration': self.best_result.iteration,
+                    'accuracy': self.best_result.accuracy,
+                    'f1_score': self.best_result.f1_score,
+                    'parameters': asdict(self.best_result.params)
+                }, f, indent=2)
+            print(f"💾 Best parameters saved to: {best_params_file}")
 
 def main():
-    """Main function to run continuous optimization"""
-    # Configuration - Replace with your actual API key
-    OPENAI_API_KEY = "sk-proj-PASTE_YOUR_KEY_HERE"
+    """Main function"""
+    parser = argparse.ArgumentParser(description="Continuous Optimization for Stock Predictions")
+    parser.add_argument("--TICKER", type=str, required=True, help="Stock symbol")
+    parser.add_argument("--no-resume", action="store_true", help="Start fresh")
+    parser.add_argument("--max-iterations", type=int, default=100)
+    parser.add_argument("--local-model", type=str, default="qwen2.5-coder:14b")
+    parser.add_argument("--base-dir", type=str, help="Base directory (default: current directory or HANABI_BASE_DIR env var)")
+    args = parser.parse_args()
     
-    # Create OpenAI client
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    
-    # Optional Claude API key (can be None if you only want to use OpenAI)
-    CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")  # Optional
+    base_dir = Path(args.base_dir) if args.base_dir else None
     
     optimizer = ContinuousOptimizer(
-        rolling_retrain_script="rolling_retrain.py",  # Your original training script
-        max_iterations=25,  # Adjust as needed
-        openai_client=openai_client,
-        claude_api_key=CLAUDE_API_KEY
+        max_iterations=args.max_iterations,
+        local_model=args.local_model,
+        TICKER=args.TICKER,
+        resume=not args.no_resume,
+        base_dir=base_dir
     )
     
     try:
         optimizer.run_optimization_loop()
     except KeyboardInterrupt:
         print(f"\n🛑 Optimization stopped by user")
-        if optimizer.best_result:
-            print(f"Best result so far: {optimizer.best_result.accuracy:.4f} accuracy")
 
 if __name__ == "__main__":
     main()
