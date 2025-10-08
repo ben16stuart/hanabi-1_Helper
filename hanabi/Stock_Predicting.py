@@ -313,7 +313,7 @@ def run_prediction(stock_symbol):
         stock_output_dir = f"{BASE_PATH}/{stock_symbol}/predictions"
         os.makedirs(stock_output_dir, exist_ok=True)
         paths = get_stock_paths(stock_symbol)
-        predict_path = f"{BASE_PATH}/hanabi-1/fear_greed_data/fear_greed_index_enhanced.csv"
+        predict_path = f"{BASE_PATH}/hanabi-1/predict.py"
         
         cmd = [
             sys.executable, predict_path,
