@@ -1,5 +1,5 @@
 # rolling_retrain.py
-# Daily model retraining and replacement system for HanABI model
+# Model retraining and replacement system for hanabi-1
 # Maintains the single best performing model (best_financial_model.pt)
 
 import os
@@ -9,18 +9,14 @@ import tempfile
 import re
 import shutil
 from datetime import datetime
+import argparse
+from pathlib import Path
 
 # === CONFIGURATION ===
-DATE_STR = datetime.now().strftime("%Y%m%d")
-TICKER = "GD"
-MAIN_DIR = "<path to>/hanabi/"
-MODEL_DIR = os.path.join(MAIN_DIR, f"{TICKER}/trained_models")
-HOURLY_DATA = os.path.join(MAIN_DIR, TICKER, "hourly_data.csv")
-FNG_DATA = os.path.join(MAIN_DIR, "sentiment-fear-and-greed/fear_greed_data/fear_greed_index_enhanced.csv")
 
-## Training parameters MSFT
+## Training parameters
 WINDOW_SIZE = 20
-HORIZON = 2
+HORIZON = 1
 BATCH_SIZE = 32
 HIDDEN_DIM = 256
 TRANSFORMER_LAYERS = 4
@@ -36,15 +32,11 @@ MIN_PRICE_CHANGE = 0.001
 DIRECTION_THRESHOLD = 0.55
 SEED = 7890
 
-SAVE_PATH = os.path.join(MAIN_DIR, f"{TICKER}/trained_models")
-
 # Model management
 BEST_MODEL_NAME = "best_financial_model.pt"
-BEST_MODEL_PATH = os.path.join(MODEL_DIR, BEST_MODEL_NAME)
-NEW_MODEL_SUFFIX = f"candidate_{DATE_STR}"
-MIN_ACCURACY_THRESHOLD = 0.52  # 55% minimum directional accuracy
+MIN_ACCURACY_THRESHOLD = 0.52  # 52% minimum directional accuracy
 
-def train_new_candidate_model():
+def train_new_candidate_model(MAIN_DIR, MODEL_DIR, TICKER, HOURLY_DATA, FNG_DATA, NEW_MODEL_SUFFIX, SAVE_PATH):
     """Train a new candidate model for evaluation"""
     print("[INFO] Training new candidate model...")
     
@@ -102,7 +94,7 @@ def train_new_candidate_model():
 
     return candidate_model_path
 
-def evaluate_single_model(model_path, model_name="model"):
+def evaluate_single_model(model_path, model_name, MAIN_DIR, HOURLY_DATA, FNG_DATA):
     """Evaluate a single model and return metrics"""
     if not os.path.exists(model_path):
         print(f"[ERROR] Model file does not exist: {model_path}")
@@ -241,7 +233,7 @@ def compare_models(best_metrics, candidate_metrics):
         print(f"     - Accuracy advantage: +{accuracy_difference:.4f}")
         return "best"
 
-def backup_and_replace_best_model(candidate_path):
+def backup_and_replace_best_model(candidate_path, BEST_MODEL_PATH, MODEL_DIR):
     """Backup current best model and replace with candidate"""
     if os.path.exists(BEST_MODEL_PATH):
         # Create backup with timestamp
@@ -263,8 +255,25 @@ def cleanup_candidate_model(candidate_path):
     except OSError as e:
         print(f"[WARNING] Could not remove candidate model {candidate_path}: {e}")
 
+
 def main():
     """Main daily model update workflow"""
+    parser = argparse.ArgumentParser(description="Daily Model Retraining for Stock Predictions")
+    parser.add_argument("--TICKER", type=str, required=True, help="Stock symbol to train")
+    
+    args = parser.parse_args()
+    
+    # Now define all the path-dependent variables
+    TICKER = args.TICKER
+    DATE_STR = datetime.now().strftime("%Y%m%d")
+    MAIN_DIR = str(Path.home() / "Desktop" / "hanabi")
+    MODEL_DIR = os.path.join(MAIN_DIR, f"{TICKER}/trained_models")
+    HOURLY_DATA = os.path.join(MAIN_DIR, TICKER, "hourly_data.csv")
+    FNG_DATA = os.path.join(MAIN_DIR, "sentiment-fear-and-greed/fear_greed_data/fear_greed_index_enhanced.csv")
+    SAVE_PATH = os.path.join(MAIN_DIR, f"{TICKER}/trained_models")
+    BEST_MODEL_PATH = os.path.join(MODEL_DIR, BEST_MODEL_NAME)
+    NEW_MODEL_SUFFIX = f"candidate_{DATE_STR}"
+
     print("=" * 80)
     print("🔄 DAILY MODEL UPDATE WORKFLOW")
     print(f"📅 Date: {DATE_STR}")
@@ -278,11 +287,11 @@ def main():
     
     try:
         # Step 1: Train new candidate model
-        candidate_path = train_new_candidate_model()
+        candidate_path = train_new_candidate_model(MAIN_DIR, MODEL_DIR, TICKER, HOURLY_DATA, FNG_DATA, NEW_MODEL_SUFFIX, SAVE_PATH)
         
         # Step 2: Evaluate candidate model
         print("\n" + "=" * 40 + " EVALUATION " + "=" * 40)
-        candidate_metrics = evaluate_single_model(candidate_path, "Candidate Model")
+        candidate_metrics = evaluate_single_model(candidate_path, "Candidate Model", MAIN_DIR, HOURLY_DATA, FNG_DATA)
         
         if candidate_metrics is None:
             print("[ERROR] Failed to evaluate candidate model. Aborting.")
@@ -295,7 +304,7 @@ def main():
         # Step 4: Evaluate current best model (if it exists)
         best_metrics = None
         if os.path.exists(BEST_MODEL_PATH):
-            best_metrics = evaluate_single_model(BEST_MODEL_PATH, "Current Best Model")
+            best_metrics = evaluate_single_model(BEST_MODEL_PATH, "Current Best Model", MAIN_DIR, HOURLY_DATA, FNG_DATA)
             if best_metrics:
                 check_accuracy_threshold(best_metrics, "Current Best Model")
         else:
@@ -315,7 +324,7 @@ def main():
             
             if winner == "candidate":
                 print("🏆 DECISION: Replacing best model with candidate")
-                backup_and_replace_best_model(candidate_path)
+                backup_and_replace_best_model(candidate_path, BEST_MODEL_PATH, MODEL_DIR)
                 cleanup_candidate_model(candidate_path)
                 print("✅ Model update completed successfully!")
             else:
@@ -326,7 +335,7 @@ def main():
         # Step 6: Final summary
         print("\n" + "=" * 40 + " SUMMARY " + "=" * 40)
         if os.path.exists(BEST_MODEL_PATH):
-            final_metrics = evaluate_single_model(BEST_MODEL_PATH, "Active Best Model")
+            final_metrics = evaluate_single_model(BEST_MODEL_PATH, "Active Best Model", MAIN_DIR, HOURLY_DATA, FNG_DATA)
             if final_metrics:
                 print(f"🎯 Active model performance: {final_metrics['accuracy']:.4f} accuracy, {final_metrics['f1']:.4f} F1")
                 if final_metrics['accuracy'] >= MIN_ACCURACY_THRESHOLD:
