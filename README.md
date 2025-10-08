@@ -6,6 +6,6 @@ This contains a front end GUI for hanabi-1 (which I had no part in building, but
 
 ## Steps to set it up yourself:
   ###### 1. Install hanabi-1 locally.
-  ###### 2. Add these files to their existing file structure.
+  ###### 2. Add these files to the existing file structure.
   ###### 3. Probably Fix & install a few dependencies
   ###### 4. Profit? and retire early? (Not verified)
