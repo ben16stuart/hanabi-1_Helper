@@ -11,26 +11,26 @@ import shutil
 from datetime import datetime
 import argparse
 from pathlib import Path
+import json
 
 # === CONFIGURATION ===
 
 ## Training parameters
-WINDOW_SIZE = 20
+WINDOW_SIZE = 24
 HORIZON = 1
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 HIDDEN_DIM = 256
 TRANSFORMER_LAYERS = 4
-NUM_HEADS = 4
-DROPOUT = 0.15
-LEARNING_RATE = 0.0005
-WEIGHT_DECAY = 0.001 
-DIRECTION_WEIGHT = 0.7
-FOCAL_GAMMA = 0.6
+NUM_HEADS = 8
+DROPOUT = 0.3
+LEARNING_RATE = 0.00005
+WEIGHT_DECAY = 0.005 
+DIRECTION_WEIGHT = 1.0
+FOCAL_GAMMA = 2.0
 EPOCHS = 150
-PATIENCE = 15
-MIN_PRICE_CHANGE = 0.001
-DIRECTION_THRESHOLD = 0.55
-SEED = 7890
+PATIENCE = 20
+MIN_PRICE_CHANGE = 0.004
+DIRECTION_THRESHOLD = 0.5
 
 # Model management
 BEST_MODEL_NAME = "best_financial_model.pt"
@@ -63,7 +63,6 @@ def train_new_candidate_model(MAIN_DIR, MODEL_DIR, TICKER, HOURLY_DATA, FNG_DATA
         "--min_price_change", str(MIN_PRICE_CHANGE),
         "--direction_threshold", str(DIRECTION_THRESHOLD),
         "--save_path", SAVE_PATH,
-        "--seed", str(SEED),
         "--model_suffix", NEW_MODEL_SUFFIX
     ]
     
@@ -102,6 +101,27 @@ def evaluate_single_model(model_path, model_name, MAIN_DIR, HOURLY_DATA, FNG_DAT
     
     print(f"[INFO] Evaluating {model_name}: {os.path.basename(model_path)}")
     
+    # Prefer writing evaluation outputs into a ticker-specific evaluations directory
+    # e.g. {MAIN_DIR}/{TICKER}/evaluations. Try to infer TICKER from the model path.
+    eval_dir = None
+    try:
+        # model_path expected like: /.../{TICKER}/trained_models/best_financial_model.pt
+        parts = os.path.abspath(model_path).split(os.path.sep)
+        # find 'trained_models' in path and take previous segment as ticker
+        if 'trained_models' in parts:
+            idx = parts.index('trained_models')
+            if idx > 0:
+                ticker = parts[idx-1]
+                eval_dir = os.path.join(MAIN_DIR, ticker, 'evaluations')
+    except Exception:
+        eval_dir = None
+
+    # Fallback to shared hanabi-1/evaluation if ticker-specific cannot be determined
+    if not eval_dir:
+        eval_dir = os.path.join(MAIN_DIR, 'hanabi-1', 'evaluation')
+
+    os.makedirs(eval_dir, exist_ok=True)
+
     cmd = [
         "python", os.path.join(MAIN_DIR, "hanabi-1/evaluate_ensemble.py"),
         "--model_path", model_path,
@@ -109,7 +129,7 @@ def evaluate_single_model(model_path, model_name, MAIN_DIR, HOURLY_DATA, FNG_DAT
         "--fear_greed_data", FNG_DATA,
         "--window_size", str(WINDOW_SIZE),
         "--horizon", str(HORIZON),
-        "--output_dir", os.path.join(MAIN_DIR, "hanabi-1/evaluation")
+        "--output_dir", eval_dir
     ]
 
     try:
@@ -246,6 +266,25 @@ def backup_and_replace_best_model(candidate_path, BEST_MODEL_PATH, MODEL_DIR):
     shutil.copy2(candidate_path, BEST_MODEL_PATH)
     print(f"[INFO] ✅ NEW BEST MODEL: {os.path.basename(candidate_path)} -> {BEST_MODEL_NAME}")
 
+    # After replacing, attempt to write best_params into the trained_models folder
+    try:
+        # Try to extract hyperparameters from checkpoint if available
+        import torch
+        checkpoint = torch.load(BEST_MODEL_PATH, map_location='cpu')
+        hyper = checkpoint.get('hyperparameters', {}) or checkpoint.get('hyperparams', {}) or {}
+    except Exception:
+        hyper = {}
+
+    # If hyper is empty, leave parameters blank; we'll still write metrics later
+    best_params_file = os.path.join(MODEL_DIR, f"best_params_{os.path.basename(os.path.dirname(MODEL_DIR))}.json")
+    try:
+        with open(best_params_file, 'w') as fh:
+            # Write parameters and a timestamp. If metrics are available elsewhere, they can be merged later.
+            json.dump({'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'parameters': hyper}, fh, indent=2)
+        print(f"[INFO] Saved best params to: {best_params_file}")
+    except Exception as e:
+        print(f"[WARNING] Could not save best_params file: {e}")
+
 def cleanup_candidate_model(candidate_path):
     """Remove candidate model if not selected"""
     try:
@@ -283,7 +322,11 @@ def main():
     
     # Ensure directories exist
     os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(os.path.join(MAIN_DIR, "hanabi-1/evaluation"), exist_ok=True)
+    # Create per-ticker evaluations directory so evaluate_ensemble writes there
+    per_ticker_eval = os.path.join(MAIN_DIR, TICKER, 'evaluations')
+    os.makedirs(per_ticker_eval, exist_ok=True)
+    # Keep legacy shared evaluation dir for compatibility
+    os.makedirs(os.path.join(MAIN_DIR, "hanabi-1", "evaluation"), exist_ok=True)
     
     try:
         # Step 1: Train new candidate model
