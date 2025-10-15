@@ -43,7 +43,6 @@ class ModelParams:
     PATIENCE: int = 15
     MIN_PRICE_CHANGE: float = 0.001
     DIRECTION_THRESHOLD: float = 0.55
-    SEED: int = 7890
 
     def validate(self) -> bool:
         """Validate parameter combinations to prevent training errors"""
@@ -273,8 +272,7 @@ class ContinuousOptimizer:
                 result.params.HIDDEN_DIM, result.params.TRANSFORMER_LAYERS, result.params.NUM_HEADS,
                 result.params.DROPOUT, result.params.LEARNING_RATE, result.params.WEIGHT_DECAY,
                 result.params.DIRECTION_WEIGHT, result.params.FOCAL_GAMMA, result.params.EPOCHS,
-                result.params.PATIENCE, result.params.MIN_PRICE_CHANGE, result.params.DIRECTION_THRESHOLD,
-                result.params.SEED
+                result.params.PATIENCE, result.params.MIN_PRICE_CHANGE, result.params.DIRECTION_THRESHOLD
             ])
     
     def save_results(self):
@@ -302,8 +300,7 @@ class ContinuousOptimizer:
             'EPOCHS': params.EPOCHS,
             'PATIENCE': params.PATIENCE,
             'MIN_PRICE_CHANGE': params.MIN_PRICE_CHANGE,
-            'DIRECTION_THRESHOLD': params.DIRECTION_THRESHOLD,
-            'SEED': params.SEED
+            'DIRECTION_THRESHOLD': params.DIRECTION_THRESHOLD
         }
         
         for param_name, param_value in param_updates.items():
@@ -524,62 +521,133 @@ class ContinuousOptimizer:
                 prompt += f"- Hidden={params.HIDDEN_DIM}, Layers={params.TRANSFORMER_LAYERS}, Batch={params.BATCH_SIZE}, Window={params.WINDOW_SIZE}\n"
 
         prompt += """
-        PARAMETER CONSTRAINTS (IMPORTANT):
-        - HIDDEN_DIM must be divisible by NUM_HEADS evenly.
+        PARAMETER CONSTRAINTS (CRITICAL):
+        - HIDDEN_DIM must be divisible by NUM_HEADS evenly (HIDDEN_DIM % NUM_HEADS == 0).
         - Avoid very large models (Hidden*Layers*Batch < 500,000 complexity).
         - BATCH_SIZE should be >= 8 to avoid normalization issues.
-        - WINDOW_SIZE should be <= 50 for memory efficiency.
+        - WINDOW_SIZE should be >= 12 (minimum context for meaningful patterns) and <= 50 for memory efficiency.
+        - NUM_HEADS must be a power of 2 or common divisor (2, 4, 6, 8, 12, 16).
+        - Total parameters should stay under 10M for reasonable training time.
 
-        SAFE PARAMETER RANGES:
-        - WINDOW_SIZE: 15-40 (sequence length)
+        SAFE PARAMETER RANGES (UPDATED):
+        - WINDOW_SIZE: 12-48 (sequence length) **RECOMMENDED: 20-30 for stock data**
         - HORIZON: 1 (keep prediction horizon at 1)
-        - BATCH_SIZE: 16-64
-        - HIDDEN_DIM: 128-512 (must divide evenly by NUM_HEADS)
-        - TRANSFORMER_LAYERS: 2-6
-        - NUM_HEADS: 2, 4, 8, 16
-        - DROPOUT: 0.1-0.25
-        - LEARNING_RATE: 0.0001-0.002
-        - WEIGHT_DECAY: 0.0001-0.01
-        - FOCAL_GAMMA: 0.5-2.0
-        - DIRECTION_WEIGHT: 0.5-1.0
-        - EPOCHS: 100-250
+        - BATCH_SIZE: 16-128 **RECOMMENDED: 32-64**
+        - HIDDEN_DIM: 128-512 (must divide evenly by NUM_HEADS) **RECOMMENDED: 256-384**
+        - TRANSFORMER_LAYERS: 2-8 **RECOMMENDED: 3-6 (deeper models risk overfitting)**
+        - NUM_HEADS: 2, 4, 6, 8, 12, 16 **RECOMMENDED: 4-8**
+        - DROPOUT: 0.1-0.5 **RECOMMENDED: 0.2-0.35 (higher for regularization)**
+        - LEARNING_RATE: 0.00001-0.001 **RECOMMENDED: 0.00003-0.0001**
+        - WEIGHT_DECAY: 0.0001-0.01 **RECOMMENDED: 0.001-0.005**
+        - FOCAL_GAMMA: 0.5-3.0 **RECOMMENDED: 1.5-2.5**
+        - DIRECTION_WEIGHT: 0.5-2.0 **RECOMMENDED: 0.8-1.2**
+        - EPOCHS: 50-250 **RECOMMENDED: 100-200 with early stopping**
+        - PATIENCE: 10-50 **RECOMMENDED: 15-30**
+        - MIN_PRICE_CHANGE: 0.001-0.01 **RECOMMENDED: 0.003-0.006 (0.3%-0.6%)**
+        - DIRECTION_THRESHOLD: 0.35-0.65 **RECOMMENDED: 0.45-0.55 (calibrate post-training)**
 
-        STRATEGIC ADJUSTMENT RULES:
-        - If the last 5 successful runs show **less than 0.2% improvement**, increase search diversity by changing 2-3 parameters more significantly (20-50% from last best).
-        - If accuracy is volatile or unstable, prioritize **stabilization**: smaller learning rate changes (x0.5-x1.2), higher dropout, or slightly larger batch.
-        - If all recent models underfit, increase model capacity (Hidden_DIM or Layers).
-        - If all overfit, lower model capacity or raise dropout.
-        - If plateaued for >50 iterations, propose **a broader search range** (e.g., test new Window sizes or alternate Head counts).
-        - Always maintain NUM_HEADS dividing HIDDEN_DIM evenly.
+        CRITICAL OBSERVATIONS ABOUT STOCK PREDICTION:
+        - **Window Size is Key**: Stock patterns need sufficient context. Windows < 12 hours lack trend information.
+        - **Generalization Gap**: If training accuracy >> validation accuracy by >10%, model is overfitting.
+        - **Random Baseline**: Stock direction is ~50% random. Accuracy < 52% means model isn't learning.
+        - **Volatility Matters**: Different stocks need different MIN_PRICE_CHANGE thresholds.
+        - **Class Balance**: Check if predictions are biased (>65% one direction indicates threshold issues).
 
+        STRATEGIC ADJUSTMENT RULES (ENHANCED):
+        
+        **If Training Accuracy is Good (>55%) but Evaluation is Poor (<53%):**
+        - PRIORITY: Reduce overfitting
+        - Increase DROPOUT by 0.05-0.10
+        - Increase WEIGHT_DECAY by 50-100%
+        - Reduce TRANSFORMER_LAYERS by 1-2
+        - Reduce HIDDEN_DIM by 25%
+        - Consider increasing WINDOW_SIZE (more data = better generalization)
+        
+        **If Both Training and Evaluation are Poor (<53%):**
+        - PRIORITY: Increase model capacity or fix data
+        - Increase WINDOW_SIZE significantly (4→20, 8→24)
+        - Increase HIDDEN_DIM by 25-50%
+        - Add 1-2 TRANSFORMER_LAYERS
+        - Try different MIN_PRICE_CHANGE thresholds
+        
+        **If Performance is Volatile (±3% accuracy between runs):**
+        - PRIORITY: Stabilize training
+        - Reduce LEARNING_RATE by 30-50%
+        - Increase BATCH_SIZE by 50-100%
+        - Increase PATIENCE for early stopping
+        - Increase DROPOUT slightly for regularization
+        
+        **If Last 5 Runs Show < 0.2% Improvement:**
+        - PRIORITY: Exploration
+        - Make 2-3 significant changes (20-50% from best)
+        - Try unexplored WINDOW_SIZE ranges
+        - Test different NUM_HEADS configurations
+        - Adjust MIN_PRICE_CHANGE threshold
+        
+        **If Plateaued for > 50 Iterations:**
+        - PRIORITY: Broader search
+        - Test WINDOW_SIZE: {12, 18, 24, 36, 48}
+        - Test architecture: {(256,4), (384,6), (512,8)} (hidden, layers)
+        - Revisit LEARNING_RATE: try 2x or 0.5x current best
+        
+        **Model Complexity Guidelines:**
+        - Low complexity (fast): Hidden=128-256, Layers=2-3
+        - Medium complexity (balanced): Hidden=256-384, Layers=3-5
+        - High complexity (slow, risky): Hidden=384-512, Layers=6-8
+        - **Prefer medium complexity for financial data**
+        
+        **Regularization Strategy:**
+        - Light: Dropout=0.1-0.2, Weight_Decay=0.001
+        - Medium: Dropout=0.2-0.3, Weight_Decay=0.002-0.005
+        - Heavy: Dropout=0.3-0.4, Weight_Decay=0.005-0.01
+        - **Start medium, increase if overfitting**
+
+        ANTI-PATTERNS TO AVOID:
+        - ❌ WINDOW_SIZE < 12 (insufficient context for stocks)
+        - ❌ Very deep models (>8 layers) without strong regularization
+        - ❌ HIDDEN_DIM not divisible by NUM_HEADS
+        - ❌ LEARNING_RATE > 0.001 (too aggressive for transformers)
+        - ❌ DROPOUT < 0.1 or > 0.5 (too little or too much regularization)
+        - ❌ BATCH_SIZE < 16 (unstable gradients)
+        - ❌ MIN_PRICE_CHANGE > 0.01 (1% is too large, misses valid signals)
+        - ❌ Changing too many parameters at once (hard to isolate impact)
+        
         REPORTING REQUIREMENTS:
-        1. Briefly classify the recent performance trend as one of: ["improving", "plateaued", "overfitting", "unstable"].
-        2. State whether to make **small incremental changes** or **larger exploratory jumps** next.
-        3. Suggest exactly ONE new parameter configuration as JSON.
-        4. Include small justification (<40 words) in a "reason" field explaining your rationale.
+        1. For the "trend" field, classify recent performance as: ["improving", "plateaued", "overfitting", "underfitting", "unstable"]
+        2. For the "strategy" field, state approach: ["exploit_best", "small_refinement", "moderate_exploration", "broad_search", "fix_overfitting", "increase_capacity"]
+        3. For the "reason" field, provide clear justification (<50 words) explaining your rationale
+        4. For the "confidence" field, rate your confidence in this recommendation: ["low", "medium", "high"]
 
-        Respond ONLY with a JSON object in this format:
+        Respond ONLY with a JSON object in this EXACT format:
         {
-            "trend": "plateaued",
-            "strategy": "explore_larger_changes",
-            "reason": "Recent runs show diminishing improvement; increasing window and hidden dim may capture longer context.",
-            "WINDOW_SIZE": 30,
+            "trend": "return the trend here",
+            "strategy": "return the strategy here",
+            "confidence": "high",
+            "reason": "return the reason here",
+            "WINDOW_SIZE": 24,
             "HORIZON": 1,
-            "BATCH_SIZE": 32,
-            "HIDDEN_DIM": 384,
+            "BATCH_SIZE": 64,
+            "HIDDEN_DIM": 256,
             "TRANSFORMER_LAYERS": 4,
             "NUM_HEADS": 8,
-            "DROPOUT": 0.18,
-            "LEARNING_RATE": 0.0006,
-            "WEIGHT_DECAY": 0.001,
-            "DIRECTION_WEIGHT": 0.7,
-            "FOCAL_GAMMA": 0.8,
+            "DROPOUT": 0.30,
+            "LEARNING_RATE": 0.00005,
+            "WEIGHT_DECAY": 0.005,
+            "DIRECTION_WEIGHT": 1.0,
+            "FOCAL_GAMMA": 2.0,
             "EPOCHS": 150,
-            "PATIENCE": 15,
-            "MIN_PRICE_CHANGE": 0.001,
-            "DIRECTION_THRESHOLD": 0.55,
-            "SEED": 7890
+            "PATIENCE": 20,
+            "MIN_PRICE_CHANGE": 0.004,
+            "DIRECTION_THRESHOLD": 0.50
         }
+        
+        FINAL REMINDER: 
+        - Prioritize generalization over training accuracy
+        - WINDOW_SIZE >= 20 is strongly recommended for stock data
+        - Regularization (dropout, weight_decay) is your friend
+        - Simpler models often generalize better than complex ones
+        - Verify HIDDEN_DIM % NUM_HEADS == 0 before responding
+        - Review the result and make sure it is JSON compliant
         """
         return prompt
     
@@ -723,7 +791,7 @@ def main():
     parser = argparse.ArgumentParser(description="Continuous Optimization for Stock Predictions")
     parser.add_argument("--TICKER", type=str, required=True, help="Stock symbol")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh")
-    parser.add_argument("--max-iterations", type=int, default=100)
+    parser.add_argument("--max-iterations", type=int, default=25)
     parser.add_argument("--local-model", type=str, default="qwen2.5-coder:14b")
     parser.add_argument("--base-dir", type=str, help="Base directory (default: current directory or HANABI_BASE_DIR env var)")
     args = parser.parse_args()
